@@ -18,7 +18,7 @@ maintainers = [
     {name = "Andreas Paepcke", email = "paepcke@cs.stanford.edu"},
 ]
 # A short description of the license
-license = {text = "MIT License"} # Replace with your actual license, e.g., MIT, Apache-2.0, etc.
+license = "MIT AND (Apache-2.0 OR BSD-2-Clause)"
 # A longer description (often read from a README file)
 readme = "README.md"
 
