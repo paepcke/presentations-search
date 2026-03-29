@@ -3,7 +3,7 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-28 15:58:06
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-28 18:52:20
+# @Last Modified time: 2026-03-29 10:08:28
 """
 presentation_indexer.py  --  Index Keynote (.key) and PowerPoint (.pptx) files
 into a Qdrant vector store for semantic search.
@@ -122,6 +122,71 @@ def _make_chunk(
     }
 
 
+OLLAMA_VISION_MODEL = "llama3.2-vision"
+
+# Prompt sent to the vision model for each image-only slide.
+# Asks for visible text first (most useful for search), then content description.
+_VISION_PROMPT = (
+    "This is a presentation slide. "
+    "First, transcribe any text you can see verbatim. "
+    "Then describe what is depicted: charts, diagrams, photos, logos, or other visual content. "
+    "Include any axis labels, legend entries, or callout text. "
+    "Be concise and factual."
+)
+
+
+# ---------------------------------------------------------------------------
+# SlideVisionCaptioner
+# ---------------------------------------------------------------------------
+
+class SlideVisionCaptioner:
+    """Generate text captions for image-only slides via Ollama's vision model.
+
+    Sends the slide image to ``llama3.2-vision`` via the Ollama chat endpoint
+    and returns a text description suitable for embedding and search.
+
+    :param ollama_url: Base URL for the Ollama REST API.
+    """
+
+    def __init__(self, ollama_url: str = DEFAULT_OLLAMA_URL) -> None:
+        self._chat_url = f"{ollama_url.rstrip('/')}/api/chat"
+
+    # ------------------------------------------------------------------
+    def caption(self, image_path: Path) -> str:
+        """Generate a caption for the image at *image_path*.
+
+        :param image_path: Path to a PNG or JPEG image file.
+        :return: Caption string, or empty string on failure.
+        :raises RuntimeError: If the Ollama API call fails.
+        """
+        import base64
+
+        try:
+            b64 = base64.b64encode(image_path.read_bytes()).decode()
+        except Exception as exc:
+            log.warn(f"Could not read image '{image_path}': {exc}")
+            return ""
+
+        payload = {
+            "model":  OLLAMA_VISION_MODEL,
+            "stream": False,
+            "messages": [{
+                "role":    "user",
+                "content": _VISION_PROMPT,
+                "images":  [b64],
+            }],
+        }
+
+        try:
+            resp = requests.post(self._chat_url, json=payload, timeout=120)
+            resp.raise_for_status()
+            return resp.json()["message"]["content"].strip()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Ollama vision API failed for '{image_path}': {exc}"
+            ) from exc
+
+
 # ---------------------------------------------------------------------------
 # Keynote extractor
 # ---------------------------------------------------------------------------
@@ -137,15 +202,24 @@ class KeynoteExtractor:
     :param key_path: Path to the ``.key`` file to extract.
     """
 
-    def __init__(self, key_path: Path) -> None:
-        self._key_path = key_path
+    def __init__(
+        self,
+        key_path:  Path,
+        captioner: "SlideVisionCaptioner | None" = None,
+        verbose:   bool = False,
+    ) -> None:
+        self._key_path  = key_path
+        self._captioner = captioner
+        self._verbose   = verbose
 
     # ------------------------------------------------------------------
     def extract(self) -> list[dict]:
         """Unpack the Keynote file and return a list of slide chunk dicts.
 
         Creates a temporary directory for unpacking that is cleaned up
-        automatically after extraction regardless of success or failure.
+        automatically after extraction.  If a ``captioner`` was supplied,
+        vision captioning runs *inside* the temp dir context so that image
+        files are still accessible.
 
         :return: List of slide payload dicts (see :func:`_make_chunk`).
         :raises RuntimeError: If ``keynote-parser`` is not installed or
@@ -156,7 +230,7 @@ class KeynoteExtractor:
         chunks: list[dict] = []
 
         with tempfile.TemporaryDirectory(prefix="kn_unpack_") as tmp_dir:
-            tmp_path = Path(tmp_dir)
+            tmp_path   = Path(tmp_dir)
             unpack_dir = tmp_path / "unpacked"
 
             result = subprocess.run(
@@ -182,23 +256,59 @@ class KeynoteExtractor:
                 )
                 return chunks
 
-            # Build archive-id → 1-based Keynote position map from Document.iwa.yaml.
-            # Also get total slide count so we can stub positions with no YAML file.
+            data_dir = unpack_dir / "Data"
+
+            # Build archive-id → 1-based Keynote position map
             position_map, total_positions = self._build_position_map(index_dir)
 
-            # Collect slide YAML files, sort by name for stable slide order
+            # Build Data/ id → filename lookup once for all slides
+            asset_map = self._build_asset_map(data_dir)
+
+            # image_map: slide_position → Path (only populated when captioning)
+            image_map: dict[int, Path] = {}
+
+            # Collect slide YAML files, sort by name for stable slide order.
+            # Modern Keynote produces individual Slide-XXXXXX.iwa.yaml files;
+            # older formats store all slides in a single Slide.iwa.yaml.
             slide_files = sorted(index_dir.glob("Slide-*.iwa.yaml"))
+            if not slide_files:
+                singular = index_dir / "Slide.iwa.yaml"
+                if singular.exists():
+                    slide_files = [singular]
             for slide_idx, yaml_file in enumerate(slide_files):
                 # Extract archive id from filename: Slide-XXXXXX.iwa.yaml
-                archive_id   = int(yaml_file.stem.split("Slide-")[1].replace(".iwa", ""))
+                # Falls back to -1 for the singular Slide.iwa.yaml format.
+                stem = yaml_file.stem  # e.g. "Slide-106936.iwa" or "Slide.iwa"
+                try:
+                    archive_id = int(stem.split("Slide-")[1].replace(".iwa", ""))
+                except (IndexError, ValueError):
+                    archive_id = -1
                 slide_pos    = position_map.get(archive_id, slide_idx + 1)
                 slide_chunks = self._parse_slide_yaml(yaml_file, slide_idx, slide_pos)
                 chunks.extend(slide_chunks)
 
-            # Emit image-only stubs for slideTree positions that have no YAML file
-            # (keynote-parser produces no output for these slides — typically pure
-            # image slides created outside Keynote, e.g. in Affinity Photo).
+                # For image-only slides, find the best asset image
+                if self._captioner and slide_chunks and slide_chunks[0].get("image_only"):
+                    img = self._find_slide_image(yaml_file, asset_map)
+                    if img:
+                        image_map[slide_pos] = img
+
+            # Emit image-only stubs for slideTree positions with no YAML file
             mapped_positions = set(position_map.values())
+            preview_jpg      = unpack_dir / "preview.jpg"
+
+            def _fallback_image() -> Path | None:
+                if preview_jpg.exists():
+                    return preview_jpg
+                if data_dir.is_dir():
+                    for ext in (".jpg", ".jpeg", ".png"):
+                        candidates = sorted(data_dir.glob(f"*{ext}"))
+                        if candidates:
+                            return candidates[0]
+                return None
+
+            fallback = _fallback_image() if self._captioner else None
+
             for pos in range(1, total_positions + 1):
                 if pos not in mapped_positions:
                     chunks.append(_make_chunk(
@@ -211,8 +321,115 @@ class KeynoteExtractor:
                         source_format="keynote",
                         image_only=True,
                     ))
+                    if fallback:
+                        image_map[pos] = fallback
+
+            # Apply captioning NOW while temp dir (and images) still exist
+            if self._captioner and image_map:
+                chunks = self._apply_captions(chunks, image_map)
 
         return chunks
+
+    # ------------------------------------------------------------------
+    def _apply_captions(
+        self,
+        chunks:    list[dict],
+        image_map: dict[int, Path],
+    ) -> list[dict]:
+        """Replace image-only stub titles with vision model captions.
+
+        Called while the temp directory is still live so image paths are valid.
+
+        :param chunks:    Slide chunk dicts from extraction.
+        :param image_map: Mapping of ``slide_position`` → image ``Path``.
+        :return: Updated chunk list.
+        """
+        total = sum(1 for c in chunks if c.get("image_only") and
+                    c.get("slide_position") in image_map)
+        done  = 0
+        log.info(f"Captioning {total} image-only slide(s) via vision model …")
+
+        for chunk in chunks:
+            if not chunk.get("image_only"):
+                continue
+            pos = chunk.get("slide_position")
+            img = image_map.get(pos)
+            if not img:
+                continue
+            try:
+                caption = self._captioner.caption(img)
+                if caption:
+                    chunk["title"]      = caption[:200]
+                    chunk["body"]       = caption
+                    chunk["text"]       = caption
+                    chunk["image_only"] = False
+                    done += 1
+                    if self._verbose:
+                        log.info(f"  Slide {pos}: captioned ({len(caption)} chars)")
+            except Exception as exc:
+                log.warn(f"  Slide {pos}: captioning failed — {exc}")
+
+        log.info(f"Captioned {done}/{total} image-only slide(s).")
+        return chunks
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _build_asset_map(data_dir: Path) -> dict[str, Path]:
+        """Build a mapping from asset identifier to file path in ``Data/``.
+
+        Keynote asset filenames end with ``-<identifier>.<ext>`` where
+        identifier matches the ``TSD.ImageArchive.data.identifier`` field.
+        Prefers full-size files over ``-small-`` variants.
+
+        :param data_dir: Path to the unpacked ``Data/`` directory.
+        :return: Dict mapping identifier string → ``Path``.
+        """
+        import re
+
+        if not data_dir.is_dir():
+            return {}
+
+        asset_map: dict[str, Path] = {}
+        for fpath in data_dir.iterdir():
+            m = re.search(r'-(\d+)\.(\w+)$', fpath.name)
+            if not m:
+                continue
+            asset_id = m.group(1)
+            # Prefer full-size over small variants — only overwrite if not set
+            # or current entry is a small variant
+            existing = asset_map.get(asset_id)
+            if existing is None or "-small-" in existing.name:
+                asset_map[asset_id] = fpath
+        return asset_map
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _find_slide_image(yaml_file: Path, asset_map: dict[str, Path]) -> Path | None:
+        """Find the best image asset for an image-only slide.
+
+        Walks the slide YAML for a ``TSD.ImageArchive`` object and extracts
+        its ``data.identifier``, then looks it up in *asset_map*.
+
+        :param yaml_file:  Path to the slide's unpacked YAML file.
+        :param asset_map:  Mapping from asset id string to ``Path``.
+        :return: ``Path`` to the image file, or ``None`` if not found.
+        """
+        try:
+            with open(yaml_file, encoding="utf-8") as fh:
+                data = yaml.safe_load(fh)
+        except Exception:
+            return None
+
+        for chunk in data.get("chunks", []):
+            for archive in chunk.get("archives", []):
+                for obj in archive.get("objects", []):
+                    if obj.get("_pbtype") == "TSD.ImageArchive":
+                        data_ref = obj.get("data", {})
+                        if isinstance(data_ref, dict):
+                            asset_id = str(data_ref.get("identifier", ""))
+                            if asset_id and asset_id in asset_map:
+                                return asset_map[asset_id]
+        return None
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -235,14 +452,14 @@ class KeynoteExtractor:
 
         doc_yaml = index_dir / "Document.iwa.yaml"
         if not doc_yaml.exists():
-            return {}
+            return {}, 0
 
         try:
             with open(doc_yaml, encoding="utf-8") as fh:
                 data = yaml.safe_load(fh)
         except Exception as exc:
             log.warn(f"Could not parse Document.iwa.yaml: {exc} — slide positions unavailable.")
-            return {}
+            return {}, 0
 
         # Locate KN.ShowArchive (referenced as 'show' from KN.DocumentArchive)
         # Find its identifier first
@@ -255,7 +472,7 @@ class KeynoteExtractor:
                         break
 
         if not show_id:
-            return {}
+            return {}, 0
 
         # Now find the KN.ShowArchive with that identifier
         ordered_tree_ids: list[int] = []
@@ -268,7 +485,7 @@ class KeynoteExtractor:
                         break
 
         if not ordered_tree_ids:
-            return {}
+            return {}, 0
 
         # Collect all yaml archive ids from Slide-*.iwa.yaml filenames
         yaml_ids = sorted(
@@ -546,31 +763,37 @@ class PresentationIndexer:
     chunks from each supported presentation file, embeds the text with
     ``nomic-embed-text``, and upserts into a local Qdrant collection.
 
-    :param index_dir:   Directory for Qdrant storage and the mtime manifest.
-    :param collection:  Qdrant collection name.
-    :param batch_size:  Number of chunks to embed and upsert per batch.
-    :param force:       If ``True``, ignore the mtime manifest and re-index all.
-    :param recursive:   If ``True`` (default), descend into subdirectories.
-    :param verbose:     If ``True``, log each file path as it is processed.
+    :param index_dir:      Directory for Qdrant storage and the mtime manifest.
+    :param collection:     Qdrant collection name.
+    :param batch_size:     Number of chunks to embed and upsert per batch.
+    :param force:          If ``True``, ignore the mtime manifest and re-index all.
+    :param recursive:      If ``True`` (default), descend into subdirectories.
+    :param verbose:        If ``True``, log each file path as it is processed.
+    :param ollama_url:     Ollama base URL for embedding and vision calls.
+    :param caption_images: If ``True``, call the vision model on image-only
+                           slides and replace their stub title with a real caption.
     """
 
     def __init__(
         self,
-        index_dir:   Path  = DEFAULT_INDEX_DIR,
-        collection:  str   = COLLECTION_NAME,
-        batch_size:  int   = 32,
-        force:       bool  = False,
-        recursive:   bool  = True,
-        verbose:     bool  = False,
-        ollama_url:  str   = DEFAULT_OLLAMA_URL,
+        index_dir:      Path  = DEFAULT_INDEX_DIR,
+        collection:     str   = COLLECTION_NAME,
+        batch_size:     int   = 32,
+        force:          bool  = False,
+        recursive:      bool  = True,
+        verbose:        bool  = False,
+        ollama_url:     str   = DEFAULT_OLLAMA_URL,
+        caption_images: bool  = False,
     ) -> None:
-        self._index_dir  = index_dir.expanduser().resolve()
-        self._collection = collection
-        self._batch_size = batch_size
-        self._force      = force
-        self._recursive  = recursive
-        self._verbose    = verbose
-        self._embed_url  = f"{ollama_url.rstrip('/')}/api/embed"
+        self._index_dir     = index_dir.expanduser().resolve()
+        self._collection    = collection
+        self._batch_size    = batch_size
+        self._force         = force
+        self._recursive     = recursive
+        self._verbose       = verbose
+        self._embed_url     = f"{ollama_url.rstrip('/')}/api/embed"
+        self._caption_images = caption_images
+        self._captioner     = SlideVisionCaptioner(ollama_url) if caption_images else None
 
         self._index_dir.mkdir(parents=True, exist_ok=True)
 
@@ -692,13 +915,21 @@ class PresentationIndexer:
     def _extract(self, pres_path: Path) -> list[dict]:
         """Dispatch extraction to the appropriate format handler.
 
+        For Keynote files, passes the vision captioner into ``KeynoteExtractor``
+        so captioning happens inside the temp dir context while images are live.
+
         :param pres_path: Path to a ``.key`` or ``.pptx`` file.
         :return: List of slide chunk dicts.
         :raises ValueError: If the file suffix is unrecognised.
         """
         suffix = pres_path.suffix.lower()
         if suffix == ".key":
-            return KeynoteExtractor(pres_path).extract()
+            captioner = self._captioner if self._caption_images else None
+            return KeynoteExtractor(
+                pres_path,
+                captioner=captioner,
+                verbose=self._verbose,
+            ).extract()
         elif suffix == ".pptx":
             return PptxExtractor(pres_path).extract()
         else:
@@ -848,6 +1079,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"Ollama base URL. Default: {DEFAULT_OLLAMA_URL}",
     )
     p.add_argument(
+        "--caption-images",
+        action="store_true",
+        help=(
+            "Call the vision model (llama3.2-vision via Ollama) on image-only "
+            "slides to generate searchable captions. Slow but improves recall "
+            "for slides with no text. Requires Ollama to be running."
+        ),
+    )
+    p.add_argument(
         "--verbose",
         action="store_true",
         help="Log each file path as it is processed.",
@@ -880,10 +1120,10 @@ def main() -> None:
         recursive=not args.no_recursive,
         verbose=args.verbose,
         ollama_url=args.ollama_url,
+        caption_images=args.caption_images,
     )
     indexer.index_inputs(inputs)
 
 
 if __name__ == "__main__":
     main()
-    
