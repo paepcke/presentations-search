@@ -3,8 +3,7 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-28 15:58:06
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-28 16:07:22
-
+# @Last Modified time: 2026-03-28 18:52:20
 """
 presentation_indexer.py  --  Index Keynote (.key) and PowerPoint (.pptx) files
 into a Qdrant vector store for semantic search.
@@ -87,28 +86,37 @@ _ORC = "\uFFFC"
 def _make_chunk(
     file_path: str,
     slide_index: int,
+    slide_position: int,
     title: str,
     body: str,
     notes: str,
     source_format: str,
+    image_only: bool = False,
 ) -> dict:
     """Return a payload dict for a single slide chunk.
 
-    :param file_path:     Absolute path to the source presentation file.
-    :param slide_index:   0-based slide position within the deck.
-    :param title:         Slide title text (may be empty).
-    :param body:          All non-title, non-note text joined with newlines.
-    :param notes:         Speaker-note text (may be empty).
-    :param source_format: ``"keynote"`` or ``"pptx"``.
+    :param file_path:      Absolute path to the source presentation file.
+    :param slide_index:    0-based index derived from sorted YAML filename order.
+                           Not meaningful as a human-readable slide number.
+    :param slide_position: 1-based slide position matching the presentation
+                           application's numbering (derived from slideTree order
+                           for Keynote; from slide order for PPTX).
+    :param title:          Slide title text (may be empty).
+    :param body:           All non-title, non-note text joined with newlines.
+    :param notes:          Speaker-note text (may be empty).
+    :param source_format:  ``"keynote"`` or ``"pptx"``.
+    :param image_only:     ``True`` if no text was extractable (image/diagram slide).
     :return: Payload dict suitable for a Qdrant ``PointStruct``.
     """
     return {
-        "file_path":     file_path,
-        "slide_index":   slide_index,
-        "title":         title,
-        "body":          body,
-        "notes":         notes,
-        "source_format": source_format,
+        "file_path":      file_path,
+        "slide_index":    slide_index,
+        "slide_position": slide_position,
+        "title":          title,
+        "body":           body,
+        "notes":          notes,
+        "source_format":  source_format,
+        "image_only":     image_only,
         # Combined text field used for embedding
         "text": "\n".join(filter(None, [title, body, notes])),
     }
@@ -174,23 +182,128 @@ class KeynoteExtractor:
                 )
                 return chunks
 
+            # Build archive-id → 1-based Keynote position map from Document.iwa.yaml.
+            # Also get total slide count so we can stub positions with no YAML file.
+            position_map, total_positions = self._build_position_map(index_dir)
+
             # Collect slide YAML files, sort by name for stable slide order
             slide_files = sorted(index_dir.glob("Slide-*.iwa.yaml"))
             for slide_idx, yaml_file in enumerate(slide_files):
-                slide_chunks = self._parse_slide_yaml(yaml_file, slide_idx)
+                # Extract archive id from filename: Slide-XXXXXX.iwa.yaml
+                archive_id   = int(yaml_file.stem.split("Slide-")[1].replace(".iwa", ""))
+                slide_pos    = position_map.get(archive_id, slide_idx + 1)
+                slide_chunks = self._parse_slide_yaml(yaml_file, slide_idx, slide_pos)
                 chunks.extend(slide_chunks)
+
+            # Emit image-only stubs for slideTree positions that have no YAML file
+            # (keynote-parser produces no output for these slides — typically pure
+            # image slides created outside Keynote, e.g. in Affinity Photo).
+            mapped_positions = set(position_map.values())
+            for pos in range(1, total_positions + 1):
+                if pos not in mapped_positions:
+                    chunks.append(_make_chunk(
+                        file_path=str(self._key_path.resolve()),
+                        slide_index=-1,
+                        slide_position=pos,
+                        title="[image-only slide]",
+                        body="",
+                        notes="",
+                        source_format="keynote",
+                        image_only=True,
+                    ))
 
         return chunks
 
     # ------------------------------------------------------------------
-    def _parse_slide_yaml(self, yaml_file: Path, slide_idx: int) -> list[dict]:
+    @staticmethod
+    def _build_position_map(index_dir: Path) -> dict[int, int]:
+        """Parse ``Document.iwa.yaml`` to map YAML archive ids to 1-based
+        Keynote slide positions.
+
+        The ``KN.ShowArchive`` in ``Document.iwa.yaml`` contains a
+        ``slideTree.slides`` list giving the presentation order.  Each entry
+        references a slideTree identifier that is slightly larger than the
+        corresponding ``Slide-XXXXXX.iwa.yaml`` archive id.  We match each
+        slideTree id to the largest yaml archive id that is ≤ the tree id
+        with a delta ≤ ``_MAX_ID_DELTA`` (empirically ~40; we use 100 for
+        safety).
+
+        :param index_dir: Path to the unpacked ``Index/`` directory.
+        :return: Dict mapping yaml archive id (int) → 1-based slide position.
+        """
+        _MAX_ID_DELTA = 100
+
+        doc_yaml = index_dir / "Document.iwa.yaml"
+        if not doc_yaml.exists():
+            return {}
+
+        try:
+            with open(doc_yaml, encoding="utf-8") as fh:
+                data = yaml.safe_load(fh)
+        except Exception as exc:
+            log.warn(f"Could not parse Document.iwa.yaml: {exc} — slide positions unavailable.")
+            return {}
+
+        # Locate KN.ShowArchive (referenced as 'show' from KN.DocumentArchive)
+        # Find its identifier first
+        show_id: str | None = None
+        for chunk in data.get("chunks", []):
+            for archive in chunk.get("archives", []):
+                for obj in archive.get("objects", []):
+                    if obj.get("_pbtype") == "KN.DocumentArchive":
+                        show_id = obj.get("show", {}).get("identifier")
+                        break
+
+        if not show_id:
+            return {}
+
+        # Now find the KN.ShowArchive with that identifier
+        ordered_tree_ids: list[int] = []
+        for chunk in data.get("chunks", []):
+            for archive in chunk.get("archives", []):
+                if archive.get("header", {}).get("identifier") == show_id:
+                    for obj in archive.get("objects", []):
+                        slides = obj.get("slideTree", {}).get("slides", [])
+                        ordered_tree_ids = [int(s["identifier"]) for s in slides]
+                        break
+
+        if not ordered_tree_ids:
+            return {}
+
+        # Collect all yaml archive ids from Slide-*.iwa.yaml filenames
+        yaml_ids = sorted(
+            int(f.stem.split("Slide-")[1].replace(".iwa", ""))
+            for f in index_dir.glob("Slide-*.iwa.yaml")
+        )
+
+        # Match each tree id to the largest yaml id ≤ tree id with delta ≤ MAX.
+        # Each yaml_id may only be claimed once (first match in slideTree order
+        # wins).  Tree ids with no unclaimed candidate have no YAML file —
+        # keynote-parser dropped them — and are silently skipped.
+        position_map: dict[int, int] = {}
+        claimed: set[int] = set()
+
+        for position, tree_id in enumerate(ordered_tree_ids, 1):
+            candidates = [y for y in yaml_ids
+                          if y <= tree_id and (tree_id - y) <= _MAX_ID_DELTA
+                          and y not in claimed]
+            if candidates:
+                matched_yaml_id = max(candidates)
+                position_map[matched_yaml_id] = position
+                claimed.add(matched_yaml_id)
+
+        return position_map, len(ordered_tree_ids)
+
+    # ------------------------------------------------------------------
+    def _parse_slide_yaml(self, yaml_file: Path, slide_idx: int, slide_position: int) -> list[dict]:
         """Parse one ``Slide-XXX.iwa.yaml`` file into zero or more chunks.
 
         A single YAML file contains one logical slide.  We collect one
         combined chunk per slide with separate title, body, and notes fields.
 
-        :param yaml_file:  Path to the unpacked YAML file.
-        :param slide_idx:  0-based slide index (from sorted filename order).
+        :param yaml_file:      Path to the unpacked YAML file.
+        :param slide_idx:      0-based index from sorted filename order.
+        :param slide_position: 1-based Keynote slide number from slideTree.
         :return: List with 0 or 1 chunk dicts for this slide.
         """
         try:
@@ -226,16 +339,12 @@ class KeynoteExtractor:
                     if kind == "NOTE":
                         note_texts.append(combined)
                     else:
-                        # Distinguish title from body by checking the parent
-                        # archive's _pbtype for KN.PlaceholderArchive with
-                        # kind kKindTitlePlaceholder — but since we resolved
-                        # objects already, use a simpler heuristic: if this is
-                        # the first non-note text on the slide and it's short,
-                        # treat it as the title.  A richer approach would
-                        # cross-reference the titlePlaceholder identifier from
-                        # the KN.SlideArchive, but this is reliable in practice.
-                        if not title_texts and len(combined) < 200:
-                            title_texts.append(combined)
+                        # Treat the first non-note, single-line short text as
+                        # the title.  Multi-line text (newlines present) is
+                        # body content even if it appears first.
+                        single_line = combined.replace("\n", " ").strip()
+                        if not title_texts and "\n" not in combined and len(single_line) < 200:
+                            title_texts.append(single_line)
                         else:
                             body_texts.append(combined)
 
@@ -244,11 +353,23 @@ class KeynoteExtractor:
         notes = "\n".join(note_texts)
 
         if not any([title, body, notes]):
-            return []
+            # Slide contains no extractable text (image/diagram only).
+            # Index a stub so the slide is counted and findable by position.
+            return [_make_chunk(
+                file_path=str(self._key_path.resolve()),
+                slide_index=slide_idx,
+                slide_position=slide_position,
+                title="[image-only slide]",
+                body="",
+                notes="",
+                source_format="keynote",
+                image_only=True,
+            )]
 
         return [_make_chunk(
             file_path=str(self._key_path.resolve()),
             slide_index=slide_idx,
+            slide_position=slide_position,
             title=title,
             body=body,
             notes=notes,
@@ -321,11 +442,23 @@ class PptxExtractor:
             body = "\n".join(body_parts)
 
             if not any([title, body, notes]):
+                # Slide contains no extractable text (image/diagram only).
+                chunks.append(_make_chunk(
+                    file_path=str(self._pptx_path.resolve()),
+                    slide_index=slide_idx,
+                    slide_position=slide_idx + 1,
+                    title="[image-only slide]",
+                    body="",
+                    notes="",
+                    source_format="pptx",
+                    image_only=True,
+                ))
                 continue
 
             chunks.append(_make_chunk(
                 file_path=str(self._pptx_path.resolve()),
                 slide_index=slide_idx,
+                slide_position=slide_idx + 1,
                 title=title,
                 body=body,
                 notes=notes,
@@ -753,3 +886,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    

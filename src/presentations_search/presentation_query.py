@@ -3,7 +3,7 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-28 16:16:32
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-28 17:15:51
+# @Last Modified time: 2026-03-28 19:04:56
 
 """
 presentation_query.py  --  Natural-language query interface for the
@@ -117,21 +117,55 @@ class AggregateHandler:
         client:     QdrantClient,
         collection: str = COLLECTION_NAME,
     ) -> None:
-        self._collection = collection
-        self._client     = client
+        self._collection      = collection
+        self._client          = client
+        self._last_agg_handler: str | None = None   # tracks last fired handler
+
+    # Regex for bare conversational number references, e.g. "what about 3?",
+    # "how about 5", "and 12?", "what about slide 7?"
+    _BARE_NUM = re.compile(
+        r'^(?:(?:how|what)\s+about\s+(?:slide\s+)?|and\s+(?:slide\s+)?)?(\d+)\??$',
+        re.IGNORECASE,
+    )
 
     # ------------------------------------------------------------------
     def try_answer(self, question: str) -> str | None:
         """Try to answer *question* as an aggregate query.
 
+        If the question looks like a bare number reference (e.g. "what about 3?"
+        or just "5?") and the previous turn was a slide-title query, the number
+        is treated as a slide position and the title handler is re-invoked.
+
         :param question: Raw user question string.
         :return: Formatted answer string, or ``None`` if not an aggregate query.
         """
-        q = question.strip().lower()
+        q = question.strip()
+
+        # Continuation: bare number after a slide-title turn
+        m_bare = self._BARE_NUM.match(q)
+        if m_bare and self._last_agg_handler == "_answer_title_of_slide":
+            try:
+                result = self._answer_title_of_slide(question, m_bare)
+                # _last_agg_handler stays the same — allows chaining
+                return result
+            except Exception as exc:
+                log.warn(f"Bare-number continuation failed: {exc}")
+                return f"  [Error answering that question: {exc}]"
+
         for pattern, method_name in _AGG_PATTERNS:
-            m = pattern.search(q)
+            m = pattern.search(q.lower())
             if m:
-                return getattr(self, method_name)(question, m)
+                try:
+                    result = getattr(self, method_name)(question, m)
+                    self._last_agg_handler = method_name
+                    return result
+                except Exception as exc:
+                    log.warn(f"Aggregate handler '{method_name}' failed: {exc}")
+                    return f"  [Error answering that question: {exc}]"
+
+        # No aggregate match — reset context so a later bare number
+        # doesn't incorrectly continue a stale slide-title session.
+        self._last_agg_handler = None
         return None
 
     # ------------------------------------------------------------------
@@ -267,13 +301,13 @@ class AggregateHandler:
         return sorted(seen)
 
     def _titles_for_file(self, file_path: str) -> list[tuple[int, str]]:
-        """Return ``(slide_index, title)`` pairs for all slides in *file_path*.
+        """Return ``(slide_position, title)`` pairs for all slides in *file_path*.
 
         Slides with an empty title are included with a placeholder so the
         slide numbering remains continuous.
 
         :param file_path: Absolute path string matching the ``file_path`` payload key.
-        :return: List of ``(slide_index, title)`` tuples, sorted by slide index.
+        :return: List of ``(slide_position, title)`` tuples, sorted by position.
         """
         from qdrant_client.models import Filter, FieldCondition, MatchValue
 
@@ -291,14 +325,16 @@ class AggregateHandler:
                 ),
                 limit=256,
                 offset=offset,
-                with_payload=["slide_index", "title"],
+                with_payload=["slide_index", "slide_position", "title"],
                 with_vectors=False,
             )
             for point in response:
-                payload    = point.payload or {}
-                slide_idx  = payload.get("slide_index", 0)
-                title      = (payload.get("title") or "").strip()
-                results.append((slide_idx, title or "—"))
+                payload  = point.payload or {}
+                # Prefer slide_position (1-based); fall back to slide_index+1
+                # for points indexed before this field was added.
+                pos   = payload.get("slide_position") or (payload.get("slide_index", 0) + 1)
+                title = (payload.get("title") or "").strip()
+                results.append((pos, title or "—"))
             if next_offset is None:
                 break
             offset = next_offset
@@ -315,9 +351,7 @@ class AggregateHandler:
         :param keyword: Substring to search for (case-insensitive).
         :return: List of matching absolute path strings.
         """
-        from qdrant_client.models import (
-            Filter, FieldCondition, MatchText, Should,
-        )
+        from qdrant_client.models import Filter, FieldCondition, MatchText
 
         seen:   set[str]   = set()
         offset: int | None = None
@@ -371,30 +405,101 @@ class AggregateHandler:
             return m.group(1).strip()
         return ""
 
+    def _answer_title_of_slide(self, question: str, match: re.Match) -> str:
+        """Return the title of a specific slide number.
+
+        :param question: Original question (used to extract slide number).
+        :param match:    Regex match containing the slide number in group 1.
+        :return: Formatted answer string.
+        """
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+        # Extract slide number from whichever capture group matched
+        num_str = match.group(1) or match.group(2) or match.group(3)
+        if not num_str:
+            return "I couldn't identify a slide number in your question."
+        slide_num = int(num_str)
+        files     = self._distinct_files()
+
+        if not files:
+            return "No presentations are currently indexed."
+
+        results = []
+        for file_path in files:
+            response, _ = self._client.scroll(
+                collection_name=self._collection,
+                scroll_filter=Filter(
+                    must=[
+                        FieldCondition(key="file_path",
+                                       match=MatchValue(value=file_path)),
+                        FieldCondition(key="slide_position",
+                                       match=MatchValue(value=slide_num)),
+                    ]
+                ),
+                limit=5,
+                with_payload=["slide_position", "title", "image_only"],
+                with_vectors=False,
+            )
+            for point in response:
+                payload   = point.payload or {}
+                title     = (payload.get("title") or "").strip()
+                img_only  = payload.get("image_only", False)
+                file_name = Path(file_path).name
+                results.append((file_name, title, img_only))
+
+        if not results:
+            return f"No slide {slide_num} found in the index."
+
+        if len(results) == 1:
+            file_name, title, img_only = results[0]
+            if img_only:
+                return f"Slide {slide_num} ({file_name}) is an image-only slide with no text title."
+            return f"Slide {slide_num} ({file_name}): \"{title}\""
+
+        # Multiple presentations — list all
+        lines = [f"Slide {slide_num} across {len(results)} presentation(s):"]
+        for file_name, title, img_only in results:
+            label = "[image-only]" if img_only else f"\"{title}\""
+            lines.append(f"  {file_name}: {label}")
+        return "\n".join(lines)
+
     @staticmethod
     def _format_title_block(file_path: str, titles: list[tuple[int, str]]) -> str:
         """Format a titled list of slides for one presentation file.
 
         :param file_path: Absolute path string of the presentation.
-        :param titles:    List of ``(slide_index, title)`` tuples.
+        :param titles:    List of ``(slide_position, title)`` tuples.
         :return: Formatted multi-line string.
         """
         name  = Path(file_path).name
         lines = [f"  {file_path}", f"  ({name})  —  {len(titles)} slide(s):"]
-        for idx, title in titles:
-            lines.append(f"    Slide {idx:>3}:  {title}")
+        for pos, title in titles:
+            lines.append(f"    Slide {pos:>3}:  {title}")
         return "\n".join(lines)
 
 
 # Populate pattern table now that the class is defined.
 # Patterns are tried in order; first match wins.
 _AGG_PATTERNS = [
-    # Title queries with keyword filter — must come before bare title query
+    # Title queries with keyword filter — must come before bare title query.
+    # Require either an explicit mention/contain verb, a quoted term, or
+    # "about" only when preceded by title/presentation context words.
+    # Does NOT match bare conversational "how about slide 4?".
     (re.compile(
-        r'\b(?:mention(?:ing|s)?|contain(?:ing|s)?|about|with\s+the\s+word|including)\b'
-        r'|show.*titl.*(?:mention|contain|about)',
+        r'\b(?:mention(?:ing|s)?|contain(?:ing|s)?|with\s+the\s+word|including)\b'
+        r'|show.*titl.*(?:mention|contain)'
+        r"|titl.*\babout\b.{0,30}['\"]"
+        r"|presentation.*\babout\b\s+\w",
         re.IGNORECASE),
      "_answer_titles_filtered"),
+
+    # Title of a specific slide number — must come before bare title listing
+    (re.compile(
+        r'\btitle\b.{0,30}\bslide\s+(\d+)\b'
+        r'|\bslide\s+(\d+)\b.{0,30}\btitle\b'
+        r'|\bwhat\b.{0,20}\bslide\s+(\d+)\b',
+        re.IGNORECASE),
+     "_answer_title_of_slide"),
 
     # Bare title listing
     (re.compile(
@@ -628,16 +733,16 @@ class ResultPrinter:
 
         for i, chunk in enumerate(chunks, 1):
             path      = chunk.get("file_path", "unknown")
-            slide_idx = chunk.get("slide_index", "?")
+            slide_pos = chunk.get("slide_position") or (chunk.get("slide_index", 0) + 1)
             fmt       = chunk.get("source_format", "")
             title     = chunk.get("title", "").strip()
             body      = chunk.get("body", "").strip()
             notes     = chunk.get("notes", "").strip()
 
-            fmt_tag = f"[{fmt}]" if fmt else ""
+            fmt_tag   = f"[{fmt}]" if fmt else ""
             title_tag = f"  \"{title}\"" if title else ""
             print(f"  {i}.  {path}{title_tag}")
-            print(f"       Slide {slide_idx}  {fmt_tag}")
+            print(f"       Slide {slide_pos}  {fmt_tag}")
 
             if self._show_slide_text:
                 print(THIN_RULE)
@@ -733,27 +838,38 @@ class PresentationQuerier:
 
         Aggregate/introspective questions (slide counts, title listings, etc.)
         are answered directly from Qdrant metadata without invoking the
-        retriever or LLM.
+        retriever or LLM.  All exceptions are caught and reported gracefully
+        so the interactive session survives unexpected errors.
 
         :param question: Natural-language question from the user.
         """
-        agg = self._aggregate.try_answer(question)
-        if agg is not None:
+        try:
+            agg = self._aggregate.try_answer(question)
+            if agg is not None:
+                print()
+                print(RULE)
+                print(agg)
+                print(RULE)
+                print()
+                return
+
+            chunks = self._retriever.retrieve(question)
+
+            explanation: str | None = None
+            if self._use_llm and self._synthesiser is not None:
+                print("  Asking LLM …")
+                explanation = self._synthesiser.explain(question, chunks)
+
+            self._printer.print_results(question, chunks, explanation)
+
+        except Exception as exc:
+            log.warn(f"Error processing question: {exc}")
             print()
             print(RULE)
-            print(agg)
+            print(f"  Error: {exc}")
+            print(f"  The session is still active — please try another question.")
             print(RULE)
             print()
-            return
-
-        chunks = self._retriever.retrieve(question)
-
-        explanation: str | None = None
-        if self._use_llm and self._synthesiser is not None:
-            print("  Asking LLM …")
-            explanation = self._synthesiser.explain(question, chunks)
-
-        self._printer.print_results(question, chunks, explanation)
 
     # ------------------------------------------------------------------
     def query_raw(self, question: str) -> dict:
@@ -763,21 +879,28 @@ class PresentationQuerier:
         ``"answer"`` key with an empty ``"chunks"`` list.
 
         Intended for use by the Flask HTTP API — returns structured data
-        rather than printing to stdout.
+        rather than printing to stdout.  Exceptions are caught and returned
+        as ``{"chunks": [], "answer": None, "error": "..."}`` so the API
+        never raises an unhandled 500.
 
         :param question: Natural-language question.
-        :return: Dict with keys ``"chunks"`` (list of payload dicts) and
-            ``"answer"`` (str or ``None``).
+        :return: Dict with keys ``"chunks"``, ``"answer"``, and optionally
+            ``"error"``.
         """
-        agg = self._aggregate.try_answer(question)
-        if agg is not None:
-            return {"chunks": [], "answer": agg}
+        try:
+            agg = self._aggregate.try_answer(question)
+            if agg is not None:
+                return {"chunks": [], "answer": agg}
 
-        chunks = self._retriever.retrieve(question)
-        answer: str | None = None
-        if self._use_llm and self._synthesiser is not None:
-            answer = self._synthesiser.explain(question, chunks)
-        return {"chunks": chunks, "answer": answer}
+            chunks = self._retriever.retrieve(question)
+            answer: str | None = None
+            if self._use_llm and self._synthesiser is not None:
+                answer = self._synthesiser.explain(question, chunks)
+            return {"chunks": chunks, "answer": answer}
+
+        except Exception as exc:
+            log.warn(f"query_raw error: {exc}")
+            return {"chunks": [], "answer": None, "error": str(exc)}
 
     # ------------------------------------------------------------------
     def reset(self) -> None:
@@ -829,7 +952,7 @@ class PresentationQuerier:
 
         # Answer the CLI-supplied question as the first turn, then loop
         if initial_question:
-            self.query(initial_question)
+            self.query(initial_question)  # exceptions caught inside query()
 
         while True:
             try:
@@ -849,7 +972,7 @@ class PresentationQuerier:
                 print()
                 continue
 
-            self.query(raw)
+            self.query(raw)  # exceptions caught inside query()
 
 
 # ---------------------------------------------------------------------------
