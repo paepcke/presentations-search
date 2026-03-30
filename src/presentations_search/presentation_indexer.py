@@ -3,7 +3,7 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-28 15:58:06
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-29 10:08:28
+# @Last Modified time: 2026-03-29 19:01:54
 """
 presentation_indexer.py  --  Index Keynote (.key) and PowerPoint (.pptx) files
 into a Qdrant vector store for semantic search.
@@ -162,10 +162,31 @@ class SlideVisionCaptioner:
         import base64
 
         try:
-            b64 = base64.b64encode(image_path.read_bytes()).decode()
+            raw_bytes = image_path.read_bytes()
         except Exception as exc:
             log.warn(f"Could not read image '{image_path}': {exc}")
             return ""
+
+        # Resize to max 1024px on the longest side before encoding — large
+        # high-resolution images cause vision model timeouts with no quality
+        # benefit for text/label extraction.
+        try:
+            from PIL import Image as _PILImage
+            import io as _io
+            img = _PILImage.open(_io.BytesIO(raw_bytes))
+            max_dim = max(img.width, img.height)
+            if max_dim > 1024:
+                scale    = 1024 / max_dim
+                new_size = (int(img.width * scale), int(img.height * scale))
+                img      = img.resize(new_size, _PILImage.LANCZOS)
+            buf = _io.BytesIO()
+            fmt = img.format or "PNG"
+            img.save(buf, format=fmt)
+            raw_bytes = buf.getvalue()
+        except Exception as exc:
+            log.warn(f"Could not resize '{image_path.name}': {exc} — using original")
+
+        b64 = base64.b64encode(raw_bytes).decode()
 
         payload = {
             "model":  OLLAMA_VISION_MODEL,
@@ -177,14 +198,24 @@ class SlideVisionCaptioner:
             }],
         }
 
-        try:
-            resp = requests.post(self._chat_url, json=payload, timeout=120)
-            resp.raise_for_status()
-            return resp.json()["message"]["content"].strip()
-        except Exception as exc:
-            raise RuntimeError(
-                f"Ollama vision API failed for '{image_path}': {exc}"
-            ) from exc
+        for attempt in range(2):   # one retry on timeout
+            try:
+                resp = requests.post(
+                    self._chat_url, json=payload, timeout=300
+                )
+                resp.raise_for_status()
+                return resp.json()["message"]["content"].strip()
+            except requests.exceptions.Timeout:
+                if attempt == 0:
+                    log.warn(f"Vision timeout on '{image_path.name}' — retrying …")
+                    continue
+                raise RuntimeError(
+                    f"Ollama vision API timed out twice for '{image_path}'"
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Ollama vision API failed for '{image_path}': {exc}"
+                ) from exc
 
 
 # ---------------------------------------------------------------------------

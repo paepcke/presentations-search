@@ -41,6 +41,7 @@ dependencies = [
     # "ollama>=0.6.1",
     "qdrant-client>=1.17.1",
     "python-pptx>=1.0.2",
+    "pillow>=12.1.1",
     # "tree-sitter>=0.25.2",
     # "tree-sitter-python>=0.25.0",
     # "tree-sitter-bash>=0.25.1",

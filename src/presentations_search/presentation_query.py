@@ -3,8 +3,7 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-28 16:16:32
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-29 08:54:07
-
+# @Last Modified time: 2026-03-29 17:07:56
 """
 presentation_query.py  --  Natural-language query interface for the
 presentation index built by ``presentation_indexer.py``.
@@ -630,6 +629,13 @@ class PresentationSynthesiser:
         "answer the question, say so in one sentence."
     )
 
+    _REWRITE_SYSTEM = (
+        "You are a search query assistant. Your only job is to rewrite a vague "
+        "follow-on question into a single, self-contained search query that can "
+        "be used to retrieve relevant presentation slides from a vector database. "
+        "Output ONLY the rewritten query — no explanation, no punctuation, no quotes."
+    )
+
     def __init__(
         self,
         model:      str = DEFAULT_MODEL,
@@ -640,41 +646,128 @@ class PresentationSynthesiser:
         self._history: list[dict] = []
 
     # ------------------------------------------------------------------
+    def rewrite_for_retrieval(self, question: str) -> str:
+        """Rewrite *question* into a standalone retrieval query using conversation history.
+
+        Always called when history is non-empty.  Returns the original question
+        unchanged when there is no history or on any error.
+
+        :param question: The user's raw question.
+        :return: Rewritten standalone query string, or *question* on failure.
+        """
+        if not self._history:
+            return question
+
+        # Build a compact conversation summary using only the Q&A intent,
+        # not the full slide excerpt dumps or file paths (which pollute the
+        # rewrite prompt and cause the LLM to echo paths as queries).
+        def _clean(msg: dict) -> str:
+            content = msg["content"]
+            if msg["role"] == "user":
+                # Strip "Slide excerpts:\n\n..." prefix, keep only the question
+                if "Question:" in content:
+                    content = content.split("Question:")[-1].strip()
+                elif "\n\n" in content:
+                    content = content.split("\n\n")[-1].strip()
+            else:
+                # Assistant: keep only the first 1-2 sentences, strip file paths
+                import re as _re
+                # Remove file path strings (anything that looks like /home/...)
+                content = _re.sub(r'/\S+\.(?:key|pptx)\S*', '[slide]', content)
+                # Keep first ~150 chars / sentence
+                sentences = content.split('.')
+                content = sentences[0].strip()
+                if len(content) < 40 and len(sentences) > 1:
+                    content = (content + '. ' + sentences[1]).strip()
+            return f"{msg['role'].upper()}: {content[:180]}"
+
+        history_summary = "\n".join(
+            _clean(msg) for msg in self._history[-6:]
+        )
+
+        rewrite_prompt = (
+            f"Conversation so far:\n{history_summary}\n\n"
+            f"New question: {question}\n\n"
+            f"Rewrite the new question as a short standalone search query using "
+            f"topic keywords only (e.g. 'TF-IDF algorithm', 'globe image slide'). "
+            f"Do NOT include file paths, slide numbers, or the words 'slide excerpt'."
+        )
+
+        payload = {
+            "model":  self._model,
+            "stream": False,
+            "messages": [
+                {"role": "system",  "content": self._REWRITE_SYSTEM},
+                {"role": "user",    "content": rewrite_prompt},
+            ],
+        }
+
+        try:
+            resp = requests.post(self._chat_url, json=payload, timeout=30)
+            resp.raise_for_status()
+            rewritten = resp.json()["message"]["content"].strip()
+            # Sanity check: if rewrite is empty or suspiciously long, fall back
+            if not rewritten or len(rewritten) > 300:
+                return question
+            log.info(f"Query rewritten for retrieval: '{rewritten}'")
+            return rewritten
+        except Exception as exc:
+            log.warn(f"Query rewrite failed: {exc} — using original question")
+            return question
+
+    # ------------------------------------------------------------------
     def reset(self) -> None:
         """Clear conversation history to start a new topic."""
         self._history = []
 
     # ------------------------------------------------------------------
-    def explain(self, question: str, chunks: list[dict]) -> str:
+    def explain(
+        self,
+        question:        str,
+        chunks:          list[dict],
+        retrieval_query: str | None = None,
+    ) -> str:
         """Generate a synthesised answer given *question* and *chunks*.
 
         Appends the exchange to internal history so follow-up questions
         have context.
 
-        :param question: The user's natural-language question.
-        :param chunks:   Retrieved slide chunk payload dicts.
+        :param question:        The user's natural-language question.
+        :param chunks:          Retrieved slide chunk payload dicts.
+        :param retrieval_query: The query actually used for retrieval, if
+            different from *question* (e.g. after rewriting).  When supplied,
+            it is shown to the LLM so it understands which slides were fetched.
         :return: LLM response text, or an error message string.
         """
         context_parts = []
         for i, chunk in enumerate(chunks, 1):
-            path       = chunk.get("file_path", "unknown")
-            slide_idx  = chunk.get("slide_index", "?")
-            title      = chunk.get("title", "")
-            body       = chunk.get("body", "")
-            notes      = chunk.get("notes", "")
-            fmt        = chunk.get("source_format", "")
+            path      = chunk.get("file_path", "unknown")
+            slide_pos = chunk.get("slide_position") or (chunk.get("slide_index", 0) + 1)
+            title     = chunk.get("title", "")
+            body      = chunk.get("body", "")
+            notes     = chunk.get("notes", "")
+            fmt       = chunk.get("source_format", "")
             context_parts.append(
-                f"[{i}] {path}  slide {slide_idx}  ({fmt})\n"
+                f"[{i}] {path}  slide {slide_pos}  ({fmt})\n"
                 f"Title: {title}\n"
                 f"Body: {body}\n"
                 f"Notes: {notes}"
             )
         context = "\n\n".join(context_parts)
 
-        user_msg = (
-            f"Slide excerpts:\n\n{context}\n\n"
-            f"Question: {question}"
-        )
+        # If the question was rewritten for retrieval, tell the LLM what was
+        # searched so it focuses on the returned chunks rather than history.
+        if retrieval_query and retrieval_query != question:
+            user_msg = (
+                f"[Slides retrieved using search query: '{retrieval_query}']\n\n"
+                f"Slide excerpts:\n\n{context}\n\n"
+                f"Question: {question}"
+            )
+        else:
+            user_msg = (
+                f"Slide excerpts:\n\n{context}\n\n"
+                f"Question: {question}"
+            )
 
         self._history.append({"role": "user", "content": user_msg})
 
@@ -830,7 +923,7 @@ class PresentationQuerier:
             client=self._retriever.client,
             collection=collection,
         )
-        self._use_llm   = use_llm
+        self._use_llm = use_llm
 
     # ------------------------------------------------------------------
     def query(self, question: str) -> None:
@@ -853,12 +946,21 @@ class PresentationQuerier:
                 print()
                 return
 
-            chunks = self._retriever.retrieve(question)
+            # Always ask the LLM to produce a standalone retrieval query
+            # from the conversation history so follow-on questions resolve
+            # correctly.  On the first turn (no history) this is a no-op.
+            retrieval_query = question
+            if self._use_llm and self._synthesiser is not None:
+                retrieval_query = self._synthesiser.rewrite_for_retrieval(question)
+
+            chunks = self._retriever.retrieve(retrieval_query)
 
             explanation: str | None = None
             if self._use_llm and self._synthesiser is not None:
                 print("  Asking LLM …")
-                explanation = self._synthesiser.explain(question, chunks)
+                explanation = self._synthesiser.explain(
+                    question, chunks, retrieval_query=retrieval_query
+                )
 
             self._printer.print_results(question, chunks, explanation)
 
@@ -892,10 +994,16 @@ class PresentationQuerier:
             if agg is not None:
                 return {"chunks": [], "answer": agg}
 
-            chunks = self._retriever.retrieve(question)
+            retrieval_query = question
+            if self._use_llm and self._synthesiser is not None:
+                retrieval_query = self._synthesiser.rewrite_for_retrieval(question)
+
+            chunks = self._retriever.retrieve(retrieval_query)
             answer: str | None = None
             if self._use_llm and self._synthesiser is not None:
-                answer = self._synthesiser.explain(question, chunks)
+                answer = self._synthesiser.explain(
+                    question, chunks, retrieval_query=retrieval_query
+                )
             return {"chunks": chunks, "answer": answer}
 
         except Exception as exc:
