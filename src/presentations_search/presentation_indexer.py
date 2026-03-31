@@ -3,7 +3,8 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-28 15:58:06
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-29 19:01:54
+# @Last Modified time: 2026-03-29 19:14:35
+
 """
 presentation_indexer.py  --  Index Keynote (.key) and PowerPoint (.pptx) files
 into a Qdrant vector store for semantic search.
@@ -42,7 +43,12 @@ Options
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import io
 import json
+import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -54,9 +60,27 @@ import requests
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
+    FieldCondition,
+    Filter,
+    MatchText,
+    MatchValue,
     PointStruct,
     VectorParams,
 )
+
+try:
+    from PIL import Image as PILImage
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+
+try:
+    from pptx import Presentation as PptxPresentation
+    from pptx.enum.text import PP_ALIGN  # noqa: F401
+    from pptx.util import Pt             # noqa: F401
+    _PPTX_AVAILABLE = True
+except ImportError:
+    _PPTX_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Module-level logger (mirrors code-search project convention)
@@ -159,8 +183,6 @@ class SlideVisionCaptioner:
         :return: Caption string, or empty string on failure.
         :raises RuntimeError: If the Ollama API call fails.
         """
-        import base64
-
         try:
             raw_bytes = image_path.read_bytes()
         except Exception as exc:
@@ -170,21 +192,21 @@ class SlideVisionCaptioner:
         # Resize to max 1024px on the longest side before encoding — large
         # high-resolution images cause vision model timeouts with no quality
         # benefit for text/label extraction.
-        try:
-            from PIL import Image as _PILImage
-            import io as _io
-            img = _PILImage.open(_io.BytesIO(raw_bytes))
-            max_dim = max(img.width, img.height)
-            if max_dim > 1024:
-                scale    = 1024 / max_dim
-                new_size = (int(img.width * scale), int(img.height * scale))
-                img      = img.resize(new_size, _PILImage.LANCZOS)
-            buf = _io.BytesIO()
-            fmt = img.format or "PNG"
-            img.save(buf, format=fmt)
-            raw_bytes = buf.getvalue()
-        except Exception as exc:
-            log.warn(f"Could not resize '{image_path.name}': {exc} — using original")
+        if _PIL_AVAILABLE:
+            try:
+                img     = PILImage.open(io.BytesIO(raw_bytes))
+                max_dim = max(img.width, img.height)
+                if max_dim > 1024:
+                    scale    = 1024 / max_dim
+                    new_size = (int(img.width * scale), int(img.height * scale))
+                    img      = img.resize(new_size, PILImage.LANCZOS)
+                buf = io.BytesIO()
+                img.save(buf, format=img.format or "PNG")
+                raw_bytes = buf.getvalue()
+            except Exception as exc:
+                log.warn(f"Could not resize '{image_path.name}': {exc} — using original")
+        else:
+            log.warn("Pillow not installed — sending full-size image to vision model")
 
         b64 = base64.b64encode(raw_bytes).decode()
 
@@ -256,8 +278,6 @@ class KeynoteExtractor:
         :raises RuntimeError: If ``keynote-parser`` is not installed or
             the unpack command fails.
         """
-        import subprocess
-
         chunks: list[dict] = []
 
         with tempfile.TemporaryDirectory(prefix="kn_unpack_") as tmp_dir:
@@ -324,21 +344,13 @@ class KeynoteExtractor:
                     if img:
                         image_map[slide_pos] = img
 
-            # Emit image-only stubs for slideTree positions with no YAML file
+            # Emit image-only stubs for slideTree positions with no YAML file.
+            # These slides (e.g. images imported from Affinity Photo) cannot be
+            # captioned reliably — the only available fallback image is the deck
+            # cover (preview.jpg), which shows a different slide entirely.
+            # Leave them as stubs; Option C (vision captioning) only applies to
+            # slides whose asset can be identified from their YAML.
             mapped_positions = set(position_map.values())
-            preview_jpg      = unpack_dir / "preview.jpg"
-
-            def _fallback_image() -> Path | None:
-                if preview_jpg.exists():
-                    return preview_jpg
-                if data_dir.is_dir():
-                    for ext in (".jpg", ".jpeg", ".png"):
-                        candidates = sorted(data_dir.glob(f"*{ext}"))
-                        if candidates:
-                            return candidates[0]
-                return None
-
-            fallback = _fallback_image() if self._captioner else None
 
             for pos in range(1, total_positions + 1):
                 if pos not in mapped_positions:
@@ -352,8 +364,6 @@ class KeynoteExtractor:
                         source_format="keynote",
                         image_only=True,
                     ))
-                    if fallback:
-                        image_map[pos] = fallback
 
             # Apply captioning NOW while temp dir (and images) still exist
             if self._captioner and image_map:
@@ -415,8 +425,6 @@ class KeynoteExtractor:
         :param data_dir: Path to the unpacked ``Data/`` directory.
         :return: Dict mapping identifier string → ``Path``.
         """
-        import re
-
         if not data_dir.is_dir():
             return {}
 
@@ -649,12 +657,12 @@ class PptxExtractor:
         :raises RuntimeError: If ``python-pptx`` is not installed or the
             file cannot be opened.
         """
-        from pptx import Presentation
-        from pptx.enum.text import PP_ALIGN  # noqa: F401 (imported for type hints)
-        from pptx.util import Pt             # noqa: F401
-
+        if not _PPTX_AVAILABLE:
+            raise RuntimeError(
+                "python-pptx is not installed. Run: pip install python-pptx"
+            )
         try:
-            prs = Presentation(str(self._pptx_path))
+            prs = PptxPresentation(str(self._pptx_path))
         except Exception as exc:
             raise RuntimeError(
                 f"python-pptx could not open '{self._pptx_path}': {exc}"
@@ -1008,7 +1016,6 @@ class PresentationIndexer:
 
         :param abs_str: Absolute path string used as the ``file_path`` payload key.
         """
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
         self._client.delete(
             collection_name=self._collection,
             points_selector=Filter(
@@ -1028,7 +1035,6 @@ class PresentationIndexer:
         :param slide_index: 0-based slide position.
         :return: Non-negative integer suitable for a Qdrant point ID.
         """
-        import hashlib
         raw = f"{abs_str}::{slide_index}"
         return int(hashlib.md5(raw.encode()).hexdigest(), 16) % (2**53)
 

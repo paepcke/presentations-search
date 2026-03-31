@@ -3,7 +3,7 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-28 16:16:32
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-29 17:07:56
+# @Last Modified time: 2026-03-30 18:17:46
 """
 presentation_query.py  --  Natural-language query interface for the
 presentation index built by ``presentation_indexer.py``.
@@ -54,6 +54,12 @@ from pathlib import Path
 import requests
 from logging_service import LoggingService
 from qdrant_client import QdrantClient
+
+try:
+    from slide_renderer import SlideRenderer
+    _RENDERER_AVAILABLE = True
+except ImportError:
+    _RENDERER_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Module-level logger
@@ -114,11 +120,15 @@ class AggregateHandler:
     def __init__(
         self,
         client:     QdrantClient,
-        collection: str = COLLECTION_NAME,
+        collection: str  = COLLECTION_NAME,
+        index_dir:  Path = Path("~/.presentation_index"),
     ) -> None:
         self._collection      = collection
         self._client          = client
-        self._last_agg_handler: str | None = None   # tracks last fired handler
+        self._index_dir       = index_dir.expanduser().resolve()
+        self._last_agg_handler: str | None = None
+        self._current_file:     str | None = None
+        self._current_slide:    int | None = None   # last slide position viewed
 
     # Regex for bare conversational number references, e.g. "what about 3?",
     # "how about 5", "and 12?", "what about slide 7?"
@@ -404,6 +414,235 @@ class AggregateHandler:
             return m.group(1).strip()
         return ""
 
+    def _answer_next_slide(self, question: str, match: re.Match) -> str:
+        """Show the next or previous slide relative to the current position.
+
+        Requires ``_current_file`` and ``_current_slide`` to be set from a
+        prior show-slide or slide-text query.
+
+        :param question: Original question.
+        :param match:    Regex match (used to detect prev vs next).
+        :return: Status string, or guidance if context is missing.
+        """
+        if not self._current_file or self._current_slide is None:
+            return (
+                "I don't know which slide you're referring to.\n"
+                "First show a specific slide, e.g. 'show me slide 105 of Lec1', "
+                "then ask 'next slide'."
+            )
+
+        # Detect direction
+        is_prev = bool(re.search(
+            r'\b(?:previous|prev|before|preceding)\b', question, re.IGNORECASE
+        ))
+
+        # Allow "next slide after N" to override the stored position
+        explicit = re.search(r'(?:after|before)\s+(\d+)', question, re.IGNORECASE)
+        if explicit:
+            base = int(explicit.group(1))
+        else:
+            base = self._current_slide
+
+        target = base - 1 if is_prev else base + 1
+
+        if target < 1:
+            return "Already at the first slide."
+
+        # Delegate to show handler with resolved context
+        fake_question = f"show me slide {target}"
+        # Temporarily ensure _current_file is set (it is) and call renderer
+        if not _RENDERER_AVAILABLE:
+            return f"Next slide would be slide {target} of {Path(self._current_file).name}."
+
+        renderer = SlideRenderer(index_dir=self._index_dir)
+        fname = Path(self._current_file).name
+        print(f"  Rendering from '{fname}' …")
+        successfully_opened = renderer.show(self._current_file, [target]) or []
+
+        if successfully_opened:
+            self._current_slide = target
+            return f"Opened: Slide {target} of {fname}"
+        return f"Slide {target} not found in '{fname}'."
+
+    def _answer_show_slide(self, question: str, match: re.Match) -> str:
+        """Render and display specific slide(s) as PNG images.
+
+        Resolves the presentation file(s) using ``_current_file`` or a
+        filename hint, then delegates to :class:`SlideRenderer`.  Refuses
+        to iterate all presentations when no file context is available,
+        to avoid triggering mass PDF conversion.
+
+        :param question: Original question.
+        :param match:    Regex match (unused — numbers extracted from question).
+        :return: Status string describing what was opened.
+        """
+        if not _RENDERER_AVAILABLE:
+            return (
+                "Slide rendering is not available — "
+                "ensure slide_renderer.py is in the same directory."
+            )
+
+        slide_nums = [
+            int(m) for m in re.findall(r'(?<![A-Za-z])(\d+)(?![A-Za-z])', question)
+        ]
+        if not slide_nums:
+            return "I couldn't identify a slide number in your question."
+
+        if self._current_file:
+            files = [self._current_file]
+        else:
+            hint = self._extract_filename_hint(question, slide_nums)
+            if hint:
+                files = hint
+            else:
+                # Safety guard: refuse to convert all presentations.
+                return (
+                    "Please specify a presentation name so I know which file to open.\n"
+                    "For example: 'show me slide 106 of Lec1'"
+                )
+
+        if not files:
+            return "No presentations are currently indexed."
+
+        renderer = SlideRenderer(index_dir=self._index_dir)
+
+        opened = []
+        opened_nums = []
+        for file_path in files:
+            fname = Path(file_path).name
+            print(f"  Rendering from '{fname}' …")
+            successfully_opened = renderer.show(file_path, slide_nums) or []
+            for n in successfully_opened:
+                opened.append(f"Slide {n} of {fname}")
+                opened_nums.append(n)
+
+        # Update current slide context to the last successfully opened slide
+        if opened_nums and len(files) == 1:
+            self._current_file  = files[0]
+            self._current_slide = opened_nums[-1]
+
+        if opened:
+            return "Opened: " + ", ".join(opened)
+        return "No slides could be rendered."
+
+    def _answer_slide_text(self, question: str, match: re.Match) -> str:
+        """Return full text content of one or more specific slides.
+
+        Handles questions like "all text on slides 39 and 40" or
+        "content of slide 5".  Uses ``_current_file`` when no presentation
+        is otherwise specified.
+
+        :param question: Original question.
+        :param match:    Regex match; groups contain slide numbers.
+        :return: Formatted answer string.
+        """
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+        # Extract slide numbers — digits NOT adjacent to letters (so "Lec3"
+        # contributes no number, but "slide 5", "5", "39 and 40" all do).
+        slide_nums = [int(m) for m in re.findall(r'(?<![A-Za-z])(\d+)(?![A-Za-z])', question)]
+        if not slide_nums:
+            return "I couldn't identify a slide number in your question."
+
+        # Resolve which file(s) to search.
+        # Priority: _current_file > filename hint in question > all files.
+        if self._current_file:
+            files = [self._current_file]
+        else:
+            # Try to find a filename fragment in the question
+            # e.g. "Lec3" matches "Lec3 - STAT60.pptx"
+            hint = self._extract_filename_hint(question, slide_nums)
+            if hint:
+                files = hint
+            else:
+                files = self._distinct_files()
+        if not files:
+            return "No presentations are currently indexed."
+
+        lines = []
+        for file_path in files:
+            fname = Path(file_path).name
+            for slide_num in slide_nums:
+                response, _ = self._client.scroll(
+                    collection_name=self._collection,
+                    scroll_filter=Filter(
+                        must=[
+                            FieldCondition(key="file_path",
+                                           match=MatchValue(value=file_path)),
+                            FieldCondition(key="slide_position",
+                                           match=MatchValue(value=slide_num)),
+                        ]
+                    ),
+                    limit=5,
+                    with_payload=["slide_position", "title", "body", "notes", "image_only"],
+                    with_vectors=False,
+                )
+                if not response:
+                    lines.append(f"  Slide {slide_num} ({fname}): not found.")
+                    continue
+                for point in response:
+                    payload  = point.payload or {}
+                    title    = (payload.get("title") or "").strip()
+                    body     = (payload.get("body") or "").strip()
+                    notes    = (payload.get("notes") or "").strip()
+                    img_only = payload.get("image_only", False)
+                    lines.append(f"  Slide {slide_num} — {fname}:")
+                    if img_only and not body:
+                        lines.append("    [image-only slide — no extractable text]")
+                    else:
+                        if title:
+                            lines.append(f"    Title:  {title}")
+                        if body:
+                            lines.append(f"    Body:   {body}")
+                        if notes:
+                            lines.append(f"    Notes:  {notes}")
+                    lines.append("")
+
+        # Track context: if all slides came from one file, update current position
+        if len(files) == 1 and slide_nums:
+            self._current_file  = files[0]
+            self._current_slide = slide_nums[-1]
+
+        return "\n".join(lines).rstrip()
+
+    def _extract_filename_hint(
+        self, question: str, slide_nums: list[int]
+    ) -> list[str]:
+        """Find indexed files whose name contains a word from *question*.
+
+        Used to resolve "Lec3, slide 5" without a full path.  Strips
+        slide numbers from the question before matching so bare digits
+        don't produce false positives.
+
+        :param question:   Raw user question.
+        :param slide_nums: Slide numbers already extracted (excluded from matching).
+        :return: List of matching absolute file paths, or empty list.
+        """
+        # Remove slide numbers and common stop words from the question
+        # to get candidate filename tokens
+        num_strs = {str(n) for n in slide_nums}
+        stop = {'show', 'all', 'text', 'on', 'slide', 'slides', 'and',
+                'the', 'of', 'in', 'for', 'me', 'content', 'body'}
+        tokens = [
+            w for w in re.split(r'[\s,\-\.]+', question)
+            if w and w not in num_strs and w.lower() not in stop
+               and len(w) > 1
+        ]
+        if not tokens:
+            return []
+
+        all_files = self._distinct_files()
+        matched = []
+        for fpath in all_files:
+            fname = Path(fpath).stem   # filename without extension
+            for token in tokens:
+                # Use word-boundary match: "Lec3" should not match "Lec30"
+                if re.search(r'(?<![A-Za-z0-9])' + re.escape(token) + r'(?![A-Za-z0-9])',
+                             fname, re.IGNORECASE):
+                    matched.append(fpath)
+                    break
+        return matched
+
     def _answer_title_of_slide(self, question: str, match: re.Match) -> str:
         """Return the title of a specific slide number.
 
@@ -491,6 +730,32 @@ _AGG_PATTERNS = [
         r"|presentation.*\babout\b\s+\w",
         re.IGNORECASE),
      "_answer_titles_filtered"),
+
+    # Next / previous slide navigation
+    (re.compile(
+        r'\b(?:next|following|after)\s+slide\b'
+        r'|\bslide\s+(?:next|after|following)\b'
+        r'|\bnext\s+(?:one|slide)\b'
+        r'|\b(?:previous|prev|before|preceding)\s+slide\b'
+        r'|\bslide\s+(?:before|previous|prev)\b',
+        re.IGNORECASE),
+     "_answer_next_slide"),
+
+    # Display/render specific slide(s) as images — must come before slide text
+    (re.compile(
+        r'\b(?:show|display|open|render|view)\b.{0,40}\bslide\s+\d+'
+        r'|\bslide\s+\d+.{0,20}\b(?:show|display|open|view)\b',
+        re.IGNORECASE),
+     "_answer_show_slide"),
+
+    # Text/content of specific slide(s) — must come before title-of-slide
+    (re.compile(
+        r'\b(?:all\s+)?(?:text|content|body|words?)\b.{0,30}\bslides?\s+\d+'
+        r'|\bslides?\s+\d+.{0,30}\b(?:text|content|body|words?)\b'
+        r'|\bslides?\s+\d+\s+and\s+\d+'
+        r'|\bshow\s+(?:me\s+)?slide\s+\d+',
+        re.IGNORECASE),
+     "_answer_slide_text"),
 
     # Title of a specific slide number — must come before bare title listing
     (re.compile(
@@ -623,10 +888,18 @@ class PresentationSynthesiser:
 
     _SYSTEM = (
         "You are a concise assistant that helps a researcher find information "
-        "across their Keynote and PowerPoint presentations.  Answer in as few "
-        "words as possible.  Always cite the file path and slide number when "
-        "referring to a specific slide.  If the provided slide excerpts do not "
-        "answer the question, say so in one sentence."
+        "across their Keynote and PowerPoint presentations. "
+        "Always cite the file path and slide number when referring to a specific slide. "
+        "There are two types of questions:\n"
+        "1. DISCOVERY questions ('find presentations about X', 'which slides cover Y'): "
+        "answer based on the file paths and slide titles in the excerpts — these ARE "
+        "the answer. If the retrieved slides are from presentations about the topic, "
+        "say so and list them.\n"
+        "2. FACT questions ('what does slide 3 say', 'explain the content of X'): "
+        "answer only from the slide text. If the text does not contain the answer, "
+        "say so in one sentence.\n"
+        "Be concise. Do not say 'slide excerpts do not provide' for discovery questions "
+        "when relevant presentations were clearly found."
     )
 
     _REWRITE_SYSTEM = (
@@ -854,10 +1127,15 @@ class ResultPrinter:
             print(RULE)
             print("  Answer:")
             print()
-            answer_indented = textwrap.indent(
-                textwrap.fill(explanation, width=68), "    "
-            )
-            print(answer_indented)
+            # Preserve the LLM's line breaks (bullet points, lists).
+            # Fill each line individually rather than reflowing the whole block.
+            for line in explanation.splitlines():
+                if line.strip():
+                    filled = textwrap.fill(line, width=68,
+                                          subsequent_indent="      ")
+                    print(textwrap.indent(filled, "    "))
+                else:
+                    print()
 
         print(RULE)
         print()
@@ -922,8 +1200,24 @@ class PresentationQuerier:
         self._aggregate = AggregateHandler(
             client=self._retriever.client,
             collection=collection,
+            index_dir=index_dir,
         )
         self._use_llm = use_llm
+
+    def _update_current_file(self, chunks: list[dict]) -> None:
+        """Update AggregateHandler's current file from retrieval results.
+
+        If all retrieved chunks come from the same presentation, that
+        presentation becomes the "current" context for subsequent aggregate
+        queries like "all text on slides 39 and 40".
+
+        :param chunks: Retrieved slide chunk payload dicts.
+        """
+        if not chunks:
+            return
+        paths = {c.get("file_path") for c in chunks if c.get("file_path")}
+        if len(paths) == 1:
+            self._aggregate._current_file = paths.pop()
 
     # ------------------------------------------------------------------
     def query(self, question: str) -> None:
@@ -954,6 +1248,7 @@ class PresentationQuerier:
                 retrieval_query = self._synthesiser.rewrite_for_retrieval(question)
 
             chunks = self._retriever.retrieve(retrieval_query)
+            self._update_current_file(chunks)
 
             explanation: str | None = None
             if self._use_llm and self._synthesiser is not None:
@@ -999,6 +1294,7 @@ class PresentationQuerier:
                 retrieval_query = self._synthesiser.rewrite_for_retrieval(question)
 
             chunks = self._retriever.retrieve(retrieval_query)
+            self._update_current_file(chunks)
             answer: str | None = None
             if self._use_llm and self._synthesiser is not None:
                 answer = self._synthesiser.explain(
@@ -1018,6 +1314,8 @@ class PresentationQuerier:
         """
         if self._synthesiser is not None:
             self._synthesiser.reset()
+        self._aggregate._current_file  = None
+        self._aggregate._current_slide = None
 
     # ------------------------------------------------------------------
     def run_interactive(self, initial_question: str | None = None) -> None:
